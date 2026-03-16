@@ -83,59 +83,73 @@ category_id: 10, 10, 20, 30, 30（重複あり）
 
 ## ロック種類別サマリマトリクス
 
-> **注意**: 以下は実測後に記入するテンプレートです。「TODO」の欄は実際に調査を行った後に更新してください。
+> 実測環境: MySQL 8.0.45 / innodb_autoinc_lock_mode=1 / 詳細は `results/lock_observations.md` 参照
 
 ### FOR UPDATE（排他行ロック）
 
-| 分離レベル | ギャップロック発生 | ブロック(同一行 FOR UPDATE) | ブロック(ギャップ内INSERT) |
-|-----------|-------------------|---------------------------|--------------------------|
-| READ UNCOMMITTED | TODO | TODO | TODO |
-| READ COMMITTED | なし | TODO | なし |
-| REPEATABLE READ | あり | TODO | あり |
-| SERIALIZABLE | TODO | TODO | TODO |
+| 分離レベル | LOCK_MODE（PK検索） | ギャップロック発生 | ブロック(同一行 FOR UPDATE) | ブロック(ギャップ内INSERT) |
+|-----------|-------------------|-----------------|---------------------------|--------------------------|
+| READ UNCOMMITTED | X,REC_NOT_GAP（推定） | なし（推定） | あり | なし（推定） |
+| READ COMMITTED | **X,REC_NOT_GAP** ✓実測 | **なし** ✓実測 | あり | **なし** ✓実測 |
+| REPEATABLE READ | **X,REC_NOT_GAP** ✓実測 | **あり (X,GAP)** ✓実測 | あり | **あり** ✓実測 |
+| SERIALIZABLE | X,REC_NOT_GAP（推定） | あり（推定） | あり | あり（推定） |
 
 ### FOR SHARE（共有行ロック）
 
-| 分離レベル | 同一行 FOR SHARE | 同一行 FOR UPDATE | ギャップ内INSERT |
-|-----------|----------------|-------------------|----------------|
-| READ UNCOMMITTED | TODO | TODO | TODO |
-| READ COMMITTED | 互換（OK） | TODO | なし |
-| REPEATABLE READ | 互換（OK） | ブロック | あり |
-| SERIALIZABLE | TODO | TODO | TODO |
+| 分離レベル | LOCK_MODE | テーブルロック | 同一行 FOR SHARE | 同一行 FOR UPDATE |
+|-----------|-----------|------------|----------------|-----------------|
+| READ UNCOMMITTED | S,REC_NOT_GAP（推定） | IS | 互換（OK） | あり |
+| READ COMMITTED | **S,REC_NOT_GAP** ✓実測 | **IS** ✓実測 | 互換（OK） | あり |
+| REPEATABLE READ | **S,REC_NOT_GAP** ✓実測 | **IS** ✓実測 | 互換（OK） | あり |
+| SERIALIZABLE | **S,REC_NOT_GAP** ✓実測 | **IS** ✓実測 | 互換（OK） | あり |
 
 ### Gap Lock（ギャップロック）
 
-| 分離レベル | Gap Lock発生 | Gap内INSERT | Gap外INSERT |
-|-----------|------------|-------------|------------|
-| READ UNCOMMITTED | TODO | TODO | OK |
-| READ COMMITTED | **なし** | OK | OK |
-| REPEATABLE READ | **あり** | ブロック | OK |
-| SERIALIZABLE | TODO | TODO | OK |
+| 分離レベル | Gap Lock発生 | LOCK_MODE | Gap内INSERT |
+|-----------|------------|-----------|------------|
+| READ UNCOMMITTED | なし（推定） | X,REC_NOT_GAP | なし（推定） |
+| READ COMMITTED | **なし** ✓実測 | **X,REC_NOT_GAP のみ** | **なし** |
+| REPEATABLE READ | **あり** ✓実測 | **X + X,GAP** | **ブロック** |
+| SERIALIZABLE | あり（推定） | S + S,GAP | ブロック（推定） |
 
 ### Next-Key Lock（ネクストキーロック）
 
-| 分離レベル | Next-Key Lock発生 | ファントムリード防止 |
-|-----------|-----------------|------------------|
-| READ UNCOMMITTED | TODO | × |
-| READ COMMITTED | 部分的 | × |
-| REPEATABLE READ | **あり** | ○ |
-| SERIALIZABLE | TODO | ○ |
+| 分離レベル | LOCK_MODE | supremum pseudo-record | ファントムリード防止 |
+|-----------|-----------|----------------------|-----------------|
+| READ UNCOMMITTED | X,REC_NOT_GAP（推定） | なし | × |
+| READ COMMITTED | **X,REC_NOT_GAP**（Recordのみ） ✓実測 | なし | × |
+| REPEATABLE READ | **X**（Next-Key）✓実測 | **あり** ✓実測 | ○ |
+| SERIALIZABLE | X（推定） | あり（推定） | ○ |
 
-### AUTO-INC Lock（オートインクリメントロック）
+> Next-Key Lock は `LOCK_MODE = 'X'`（REC_NOT_GAP なし）で表現される。
+> 範囲検索の **最初のレコード** のみ `X,REC_NOT_GAP`（前のギャップ不要のため）。
 
-| lock_mode | 動作 | 並行INSERT |
-|-----------|------|-----------|
-| 0 (traditional) | テーブルロック | ブロック |
-| 1 (consecutive) | シンプルINSERTは軽量ロック | TODO |
-| 2 (interleaved) | 全て軽量ロック | OK（連番ギャップあり） |
+### セカンダリインデックスのロック（実測）
+
+`WHERE category_id = 20 FOR UPDATE`（REPEATABLE READ）:
+
+| INDEX_NAME  | LOCK_MODE     | LOCK_DATA | 意味 |
+|-------------|---------------|-----------|------|
+| NULL        | IX            | NULL      | テーブルIX |
+| idx_category| **X**         | 20, 3     | Next-Key Lock (cat=20, id=3) |
+| idx_category| **X,GAP**     | 30, 4     | Gap Lock（次カテゴリへの挿入防止） |
+| PRIMARY     | **X,REC_NOT_GAP** | 3     | PK Record Lock |
+
+### AUTO-INC Lock（innodb_autoinc_lock_mode=1）
+
+| lock_mode | シンプルINSERT | data_locksの表示 | 並行INSERT |
+|-----------|-------------|----------------|-----------|
+| 0 (traditional) | AUTO_INCテーブルロック | `AUTO_INC` | ブロック |
+| **1 (consecutive) ✓実測** | 軽量mutex | **TABLE IX のみ**（AUTO_INC表示なし） | **ブロックなし** |
+| 2 (interleaved) | 軽量mutex | TABLE IX のみ | ブロックなし |
 
 ### Deadlock（デッドロック）
 
 | パターン | 発生条件 | InnoDBの対応 |
 |---------|---------|------------|
-| 古典的デッドロック | 逆順ロック取得 | 自動検知・ロールバック |
-| Gap Lockデッドロック | 重複ギャップロック | TODO |
-| FK関連デッドロック | テーブル間の逆順 | TODO |
+| 古典的デッドロック | 逆順ロック取得 | 自動検知・被害者をROLLBACK |
+| Gap Lockデッドロック | 重複ギャップ + INSERT | 自動検知・被害者をROLLBACK |
+| テーブル間デッドロック | テーブル間の逆順ロック | 自動検知・被害者をROLLBACK |
 
 ## Observer でのロック確認コマンド
 

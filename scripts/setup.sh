@@ -12,13 +12,17 @@ MYSQL_LOG="$MYSQL_DATA_DIR/mysql-error.log"
 echo "=== MySQL 8.4 LTS セットアップ開始 ==="
 
 # データディレクトリ作成・初期化
-if [ ! -d "$MYSQL_DATA_DIR" ]; then
+# mysql.ibd の存在でDBが初期化済みかを判定（ログファイルのみの場合は未初期化）
+mkdir -p "$MYSQL_DATA_DIR"
+if [ ! -f "$MYSQL_DATA_DIR/mysql.ibd" ]; then
   echo "MySQLデータディレクトリを初期化中..."
-  mkdir -p "$MYSQL_DATA_DIR"
+  # --initialize はディレクトリにファイルがあると失敗するため、ログファイルを事前に除去
+  rm -f "$MYSQL_DATA_DIR"/*.log "$MYSQL_DATA_DIR"/*.err
   mysqld --initialize-insecure \
     --datadir="$MYSQL_DATA_DIR" \
     --user="$(whoami)" \
-    2>&1 | tee "$MYSQL_LOG"
+    --log-error="$MYSQL_LOG" \
+    2>&1
   echo "初期化完了"
 else
   echo "既存のデータディレクトリを使用: $MYSQL_DATA_DIR"
