@@ -89,16 +89,18 @@ category_id: 10, 10, 20, 30, 30（重複あり）
 
 | 分離レベル | LOCK_MODE（PK検索） | ギャップロック発生 | ブロック(同一行 FOR UPDATE) | ブロック(ギャップ内INSERT) |
 |-----------|-------------------|-----------------|---------------------------|--------------------------|
-| READ UNCOMMITTED | X,REC_NOT_GAP（推定） | なし（推定） | あり | なし（推定） |
+| READ UNCOMMITTED | **X,REC_NOT_GAP** ✓実測 | **なし** ✓実測 | あり | **あり** ✓実測※ |
 | READ COMMITTED | **X,REC_NOT_GAP** ✓実測 | **なし** ✓実測 | あり | **なし** ✓実測 |
 | REPEATABLE READ | **X,REC_NOT_GAP** ✓実測 | **あり (X,GAP)** ✓実測 | あり | **あり** ✓実測 |
-| SERIALIZABLE | X,REC_NOT_GAP（推定） | あり（推定） | あり | あり（推定） |
+| SERIALIZABLE | **X,REC_NOT_GAP** ✓実測 | **あり (X,GAP)** ✓実測 | あり | **あり** ✓実測 |
+
+> ※ READ UNCOMMITTED でもギャップ内 INSERT は **RR/SERIALIZABLE セッションのギャップロック** によってブロックされる。Gap Lock の効果はロックを保持する側の分離レベルで決まり、INSERT 側の分離レベルは関係しない。
 
 ### FOR SHARE（共有行ロック）
 
 | 分離レベル | LOCK_MODE | テーブルロック | 同一行 FOR SHARE | 同一行 FOR UPDATE |
 |-----------|-----------|------------|----------------|-----------------|
-| READ UNCOMMITTED | S,REC_NOT_GAP（推定） | IS | 互換（OK） | あり |
+| READ UNCOMMITTED | **S,REC_NOT_GAP** ✓実測 | **IS** ✓実測 | 互換（OK） | あり |
 | READ COMMITTED | **S,REC_NOT_GAP** ✓実測 | **IS** ✓実測 | 互換（OK） | あり |
 | REPEATABLE READ | **S,REC_NOT_GAP** ✓実測 | **IS** ✓実測 | 互換（OK） | あり |
 | SERIALIZABLE | **S,REC_NOT_GAP** ✓実測 | **IS** ✓実測 | 互換（OK） | あり |
@@ -107,19 +109,19 @@ category_id: 10, 10, 20, 30, 30（重複あり）
 
 | 分離レベル | Gap Lock発生 | LOCK_MODE | Gap内INSERT |
 |-----------|------------|-----------|------------|
-| READ UNCOMMITTED | なし（推定） | X,REC_NOT_GAP | なし（推定） |
+| READ UNCOMMITTED | **なし** ✓実測 | **X,REC_NOT_GAP のみ** ✓実測 | **なし（RU自身はGap Lockを取らない）** ✓実測 |
 | READ COMMITTED | **なし** ✓実測 | **X,REC_NOT_GAP のみ** | **なし** |
 | REPEATABLE READ | **あり** ✓実測 | **X + X,GAP** | **ブロック** |
-| SERIALIZABLE | あり（推定） | S + S,GAP | ブロック（推定） |
+| SERIALIZABLE | **あり** ✓実測 | **X + X,GAP** ✓実測 | **ブロック** ✓実測 |
 
 ### Next-Key Lock（ネクストキーロック）
 
 | 分離レベル | LOCK_MODE | supremum pseudo-record | ファントムリード防止 |
 |-----------|-----------|----------------------|-----------------|
-| READ UNCOMMITTED | X,REC_NOT_GAP（推定） | なし | × |
+| READ UNCOMMITTED | **X,REC_NOT_GAP**（Recordのみ）✓実測 | なし | × |
 | READ COMMITTED | **X,REC_NOT_GAP**（Recordのみ） ✓実測 | なし | × |
 | REPEATABLE READ | **X**（Next-Key）✓実測 | **あり** ✓実測 | ○ |
-| SERIALIZABLE | X（推定） | あり（推定） | ○ |
+| SERIALIZABLE | **X**（Next-Key）✓実測 | **あり** ✓実測 | ○ |
 
 > Next-Key Lock は `LOCK_MODE = 'X'`（REC_NOT_GAP なし）で表現される。
 > 範囲検索の **最初のレコード** のみ `X,REC_NOT_GAP`（前のギャップ不要のため）。
@@ -147,9 +149,19 @@ category_id: 10, 10, 20, 30, 30（重複あり）
 
 | パターン | 発生条件 | InnoDBの対応 |
 |---------|---------|------------|
-| 古典的デッドロック | 逆順ロック取得 | 自動検知・被害者をROLLBACK |
-| Gap Lockデッドロック | 重複ギャップ + INSERT | 自動検知・被害者をROLLBACK |
+| 古典的デッドロック ✓実測 | 逆順ロック取得 | 自動検知・被害者をROLLBACK |
+| Gap Lockデッドロック ✓実測 | 重複ギャップ + INSERT（A: id>20<40 ＋ B: id>10<30）| 自動検知・被害者をROLLBACK |
 | テーブル間デッドロック | テーブル間の逆順ロック | 自動検知・被害者をROLLBACK |
+
+**Gap Lock デッドロックの成立条件（実測）:**
+```
+Session A: WHERE id > 20 AND id < 40 FOR UPDATE → X on 30, X,GAP on 40
+Session B: WHERE id > 10 AND id < 30 FOR UPDATE → X on 20, X,GAP on 30
+           （同時成立: Gap Lock同士は互換 → 両者GRANTED）
+Session B: INSERT id=35 → INSERT_INTENTION on (30,40) → A の X,GAP on 40 で WAIT
+Session A: INSERT id=25 → INSERT_INTENTION on (20,30) → B の X,GAP on 30 で WAIT
+           → 循環待機 → ERROR 1213 (Session A がロールバック被害者)
+```
 
 ## Observer でのロック確認コマンド
 
