@@ -186,7 +186,132 @@ USER LEVEL LOCK| test_advisory  | EXCLUSIVE | GRANTED
 
 ---
 
-## 10. Gap Lock デッドロック（実証済み）
+## 10. 空テーブル・対象不在のロック挙動（実測）
+
+実測日: 2026-03-17
+MySQL: 8.0.45 / innodb_autoinc_lock_mode=1
+
+### 10-1. テーブル空 + 範囲 FOR UPDATE（`WHERE id > 20 AND id < 40`）
+
+```
+READ UNCOMMITTED / READ COMMITTED:
+  LOCK_TYPE=TABLE  LOCK_MODE=IX                   LOCK_DATA=NULL
+  （ROW ロックなし）
+
+REPEATABLE READ / SERIALIZABLE:
+  LOCK_TYPE=TABLE  LOCK_MODE=IX                   LOCK_DATA=NULL
+  LOCK_TYPE=RECORD LOCK_MODE=X                    LOCK_DATA=supremum pseudo-record
+```
+
+**→ RR/SERIALIZABLE はテーブル全体のギャップ (-∞, +∞) を supremum pseudo-record への Next-Key Lock で封鎖する。**
+
+### 10-2. テーブル空 + PK ポイント FOR UPDATE（`WHERE id = 30`）
+
+```
+READ UNCOMMITTED / READ COMMITTED:
+  LOCK_TYPE=TABLE  LOCK_MODE=IX                   LOCK_DATA=NULL
+  （ROW ロックなし）
+
+REPEATABLE READ / SERIALIZABLE:
+  LOCK_TYPE=TABLE  LOCK_MODE=IX                   LOCK_DATA=NULL
+  LOCK_TYPE=RECORD LOCK_MODE=X                    LOCK_DATA=supremum pseudo-record
+```
+
+**→ PK 指定でも範囲指定でも、テーブルが空なら RR/SERIALIZABLE は supremum のみ。**
+
+### 10-3. テーブル空 + 通常 SELECT 範囲（SERIALIZABLE 比較）
+
+```
+REPEATABLE READ:
+  （ロックなし — IX テーブルロックも発生しない）
+
+SERIALIZABLE:
+  LOCK_TYPE=TABLE  LOCK_MODE=IS                   LOCK_DATA=NULL
+  LOCK_TYPE=RECORD LOCK_MODE=S                    LOCK_DATA=supremum pseudo-record
+```
+
+**→ SERIALIZABLE は通常 SELECT でも supremum に S（共有 Next-Key Lock）を自動付与する。RR は通常 SELECT ではロックを取らない。**
+
+---
+
+### 10-4. データあり + 不在PK=25（20と30の間）FOR UPDATE
+
+```
+READ UNCOMMITTED / READ COMMITTED:
+  LOCK_TYPE=TABLE  LOCK_MODE=IX                   LOCK_DATA=NULL
+  （ROW ロックなし）
+
+REPEATABLE READ / SERIALIZABLE:
+  LOCK_TYPE=TABLE  LOCK_MODE=IX                   LOCK_DATA=NULL
+  LOCK_TYPE=RECORD LOCK_MODE=X,GAP                LOCK_DATA=30
+```
+
+**→ 「次のレコード（id=30）の前のギャップ (20,30)」に Gap Lock のみ設定される。**
+Record Lock なし（レコードが存在しないため）。
+
+### 10-5. データあり + 不在PK=99（最大値50超）FOR UPDATE
+
+```
+READ UNCOMMITTED / READ COMMITTED:
+  （ROW ロックなし）
+
+REPEATABLE READ / SERIALIZABLE:
+  LOCK_TYPE=TABLE  LOCK_MODE=IX                   LOCK_DATA=NULL
+  LOCK_TYPE=RECORD LOCK_MODE=X                    LOCK_DATA=supremum pseudo-record
+```
+
+**→ 最大値を超えるキーを検索すると supremum pseudo-record に Next-Key Lock（`LOCK_MODE=X`）。**
+`X,GAP` ではなく `X`（Next-Key Lock）である点に注意。supremum はレコードとして扱われるため。
+
+### 10-6. データあり + 不在PK=5（最小値10未満）FOR UPDATE
+
+```
+READ UNCOMMITTED / READ COMMITTED:
+  （ROW ロックなし）
+
+REPEATABLE READ / SERIALIZABLE:
+  LOCK_TYPE=TABLE  LOCK_MODE=IX                   LOCK_DATA=NULL
+  LOCK_TYPE=RECORD LOCK_MODE=X,GAP                LOCK_DATA=10
+```
+
+**→ 「最初のレコード（id=10）の前のギャップ (-∞,10)」に Gap Lock（`X,GAP`）。**
+
+### 10-7. データあり + 不在PK=25 FOR SHARE
+
+```
+READ UNCOMMITTED / READ COMMITTED:
+  LOCK_TYPE=TABLE  LOCK_MODE=IS                   LOCK_DATA=NULL
+  （ROW ロックなし）
+
+REPEATABLE READ / SERIALIZABLE:
+  LOCK_TYPE=TABLE  LOCK_MODE=IS                   LOCK_DATA=NULL
+  LOCK_TYPE=RECORD LOCK_MODE=S,GAP                LOCK_DATA=30
+```
+
+**→ FOR SHARE でも Gap Lock のパターンは FOR UPDATE と同じ。`X,GAP` が `S,GAP` になるだけ。**
+
+---
+
+### まとめ: 不在キー・空テーブルのロック挙動パターン
+
+| 状況 | 位置 | RU/RC | RR/SERIALIZABLE |
+|------|------|-------|----------------|
+| テーブル空 + 任意検索 | - | ロックなし | `X` on supremum |
+| テーブル空 + SERIALIZABLE 通常 SELECT | - | ロックなし | `S` on supremum |
+| 不在PK（最小値未満）| id < 最小値 | ロックなし | `X,GAP` on 最小値レコード |
+| 不在PK（レコード間）| a < id < b | ロックなし | `X,GAP` on 次レコード(b) |
+| 不在PK（最大値超）| id > 最大値 | ロックなし | `X` on supremum |
+| 不在PK + FOR SHARE | （同上） | ロックなし | 上記の `X` → `S`、`X,GAP` → `S,GAP` |
+
+**キー観察:**
+- `X,GAP`（Gap Lock）: 不在キーが「レコードとレコードの間」または「最小値未満」のとき
+- `X`（Next-Key Lock on supremum）: 不在キーが「最大値超」またはテーブルが空のとき
+- supremum pseudo-record は「テーブル末尾の番兵」であり、これへの `X` = (-∞, +∞) の封鎖
+- RU/RC では **不在キーへの検索でもロックは一切取得されない**
+
+---
+
+## 11. Gap Lock デッドロック（実証済み）
 
 ### 成立シナリオ
 
@@ -223,7 +348,7 @@ Session A: INSERT INTO products (id, name, category_id) VALUES (25, 'test', 10);
 
 ---
 
-## 11. READ UNCOMMITTED 追加実測
+## 12. READ UNCOMMITTED 追加実測
 
 ### FOR UPDATE PK 検索（`WHERE id = 30 FOR UPDATE`）
 
@@ -266,7 +391,7 @@ Session B (READ UNCOMMITTED): INSERT INTO products (id, ...) VALUES (25, ...);
 
 ---
 
-## 12. SERIALIZABLE 追加実測
+## 13. SERIALIZABLE 追加実測
 
 ### FOR UPDATE PK 検索（`WHERE id = 30 FOR UPDATE`）
 
