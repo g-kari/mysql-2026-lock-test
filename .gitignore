@@ -1,9 +1,10 @@
 # MySQLデータディレクトリ
 mysql-data/
 
-# 実行結果（.gitkeepは除外しない）
+# 実行結果（.gitkeepとMarkdownメモは追跡、生ログは除外）
 results/*
 !results/.gitkeep
+!results/*.md
 
 # devbox
 .devbox/
