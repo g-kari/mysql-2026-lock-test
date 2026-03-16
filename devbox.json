@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jetify-com/devbox/0.13.7/.schema/devbox.schema.json",
+  "packages": [
+    "mysql80@latest"
+  ],
+  "shell": {
+    "init_hook": [
+      "echo 'MySQL 8.4 LTS ロック挙動調査環境'",
+      "echo 'セットアップ: ./scripts/setup.sh'",
+      "echo '停止: ./scripts/teardown.sh'"
+    ],
+    "scripts": {
+      "setup": "bash scripts/setup.sh",
+      "teardown": "bash scripts/teardown.sh",
+      "connect-a": "bash scripts/connect-a.sh",
+      "connect-b": "bash scripts/connect-b.sh",
+      "observe": "bash scripts/observe-locks.sh"
+    }
+  }
+}

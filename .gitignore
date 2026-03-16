@@ -1,0 +1,13 @@
+# MySQLデータディレクトリ
+mysql-data/
+
+# 実行結果（.gitkeepは除外しない）
+results/*
+!results/.gitkeep
+
+# devbox
+.devbox/
+
+# その他
+*.log
+.DS_Store

@@ -1,0 +1,119 @@
+-- =====================================================
+-- Advisory Lock（アドバイザリロック）
+-- 目的: GET_LOCK / RELEASE_LOCK / IS_FREE_LOCK の動作確認
+--       InnoDBトランザクションロックとは独立した仕組みを理解する
+-- =====================================================
+
+-- アドバイザリロックの特徴:
+--   - トランザクションと独立（COMMIT/ROLLBACKで解放されない）
+--   - セッションに紐づく（セッション切断で自動解放）
+--   - 名前ベースのロック（任意の文字列キー）
+--   - 同一セッション内で複数取得可能
+--   - 用途: アプリケーションレベルの排他制御
+
+-- =====================================================
+-- Step 1: Session A - アドバイザリロック取得
+-- 別ターミナル(Session A)で実行
+-- =====================================================
+-- -- ロック取得（タイムアウト10秒）
+-- SELECT GET_LOCK('my_advisory_lock', 10) AS lock_acquired;
+-- -- 返り値: 1 = 取得成功, 0 = タイムアウト, NULL = エラー
+--
+-- -- 保持者の確認
+-- SELECT IS_USED_LOCK('my_advisory_lock') AS holder_connection_id;
+-- -- 返り値: 自分のCONNECTION_ID()が返る
+--
+-- -- 空き状態確認
+-- SELECT IS_FREE_LOCK('my_advisory_lock') AS is_free;
+-- -- 返り値: 0（使用中）
+
+-- =====================================================
+-- Step 2: Observer - アドバイザリロック状態確認
+-- 別ターミナル(Observer)で実行
+-- =====================================================
+-- -- アドバイザリロックはperformance_schema.data_locksには表示されない
+-- -- metadata_locksに表示される
+-- SELECT
+--   OBJECT_TYPE,
+--   OBJECT_SCHEMA,
+--   OBJECT_NAME,
+--   LOCK_TYPE,
+--   LOCK_STATUS,
+--   SOURCE,
+--   OWNER_THREAD_ID,
+--   OWNER_EVENT_ID
+-- FROM performance_schema.metadata_locks
+-- WHERE OBJECT_TYPE = 'USER LEVEL LOCK';
+
+-- =====================================================
+-- Step 3: Session B - 同名ロック取得試行
+-- 別ターミナル(Session B)で実行
+-- =====================================================
+-- -- 即時タイムアウト(0秒)で試みる → 失敗
+-- SELECT GET_LOCK('my_advisory_lock', 0) AS lock_acquired;
+-- -- 返り値: 0（取得失敗）
+--
+-- -- 空き状態確認
+-- SELECT IS_FREE_LOCK('my_advisory_lock') AS is_free;
+-- -- 返り値: 0（Session Aが保持中）
+--
+-- -- 保持者確認
+-- SELECT IS_USED_LOCK('my_advisory_lock') AS holder_connection_id;
+-- -- Session AのCONNECTION_ID()が返る
+--
+-- -- タイムアウト付きで待機（3秒）
+-- SELECT GET_LOCK('my_advisory_lock', 3) AS lock_acquired;
+-- -- Session Aが3秒以内に解放しなければ 0 が返る
+
+-- =====================================================
+-- Step 4: Session A - トランザクション内でCOMMIT（ロックは解放されない）
+-- 別ターミナル(Session A)で実行
+-- =====================================================
+-- BEGIN;
+-- UPDATE accounts SET balance = 9999.00 WHERE id = 30;
+-- COMMIT;
+-- -- COMMITしても GET_LOCK で取得したロックは解放されない！
+-- -- （トランザクションと独立）
+--
+-- -- Session Bで確認: まだロック保持中
+-- -- Session B: SELECT IS_FREE_LOCK('my_advisory_lock') AS is_free;
+-- -- 返り値: 0（まだ保持中）
+
+-- =====================================================
+-- Step 5: Session A - 明示的にロック解放
+-- 別ターミナル(Session A)で実行
+-- =====================================================
+-- SELECT RELEASE_LOCK('my_advisory_lock') AS released;
+-- -- 返り値: 1（解放成功）
+--
+-- -- Session B で再取得
+-- -- Session B: SELECT GET_LOCK('my_advisory_lock', 5) AS lock_acquired;
+-- -- 返り値: 1（取得成功）
+
+-- =====================================================
+-- Step 6: 異なる名前のロックは干渉しない
+-- =====================================================
+-- Session A: SELECT GET_LOCK('lock_A', 5) AS a;
+-- Session B: SELECT GET_LOCK('lock_B', 5) AS b;
+-- -- 両方とも即時取得（異なる名前は独立）
+--
+-- Session A: SELECT GET_LOCK('lock_B', 0) AS b;  -- 0（Session Bが保持中）
+-- Session B: SELECT GET_LOCK('lock_A', 0) AS a;  -- 0（Session Aが保持中）
+-- -- 注意: この状態でお互いを待つとデッドロック！
+-- -- MySQLはアドバイザリロックのデッドロックも検知する
+
+-- =====================================================
+-- クリーンアップ
+-- =====================================================
+-- 各セッション: SELECT RELEASE_ALL_LOCKS() AS released_count;
+-- Observer: source sql/helpers/reset_data.sql
+
+-- =====================================================
+-- 調査結果メモ
+-- =====================================================
+-- 実測後にここに記入:
+-- - GET_LOCK取得成功: 返り値 = 1
+-- - GET_LOCKタイムアウト: 返り値 = 0
+-- - COMMIT後もロック保持: 確認できたか
+-- - metadata_locksでの確認: OBJECT_TYPE = 'USER LEVEL LOCK'
+-- - 備考: アドバイザリロックはアプリケーション側の排他制御に使用
