@@ -186,6 +186,122 @@ USER LEVEL LOCK| test_advisory  | EXCLUSIVE | GRANTED
 
 ---
 
+## 10. Gap Lock デッドロック（実証済み）
+
+### 成立シナリオ
+
+```
+Session A: BEGIN; SELECT * FROM products WHERE id > 20 AND id < 40 FOR UPDATE;
+  → GRANTED: X (id=30), X,GAP (id=40)
+
+Session B: BEGIN; SELECT * FROM products WHERE id > 10 AND id < 30 FOR UPDATE;
+  → GRANTED: X (id=20), X,GAP (id=30)
+  ※ Gap Lock 同士は互換のため両者 GRANTED
+
+Session B: INSERT INTO products (id, name, category_id) VALUES (35, 'test', 10);
+  → INSERT_INTENTION on gap (30,40) → Session A の X,GAP on 40 で WAIT
+
+Session A: INSERT INTO products (id, name, category_id) VALUES (25, 'test', 10);
+  → INSERT_INTENTION on gap (20,30) → Session B の X,GAP on 30 で WAIT
+  → 循環待機 → ERROR 1213: Deadlock found
+  → Session A がロールバック被害者（修正行数が少ない側）
+```
+
+### SHOW ENGINE INNODB STATUS — LATEST DETECTED DEADLOCK で確認した情報
+
+- デッドロック検知タイムスタンプ
+- Transaction 1（Session B相当）: `HOLDS X,GAP on id=30`, `WAITING X,INSERT_INTENTION on gap (30,40)`
+- Transaction 2（Session A相当）: `HOLDS X,GAP on id=40`, `WAITING X,INSERT_INTENTION on gap (20,30)`
+- `WE ROLL BACK TRANSACTION (2)` — Session A が被害者として明示
+
+### 重要な観察
+
+- **Gap Lock 同士は互換**: 両セッションが重複するギャップにロックを取得できる
+- **INSERT_INTENTION vs Gap Lock は非互換**: INSERT が Gap Lock 保持セッションを待機させる
+- **循環待機の成立**: A が B のギャップを待ち、B が A のギャップを待つ → デッドロック
+- Gap Lock デッドロックは REPEATABLE READ / SERIALIZABLE でのみ発生（Gap Lock が存在しないため）
+
+---
+
+## 11. READ UNCOMMITTED 追加実測
+
+### FOR UPDATE PK 検索（`WHERE id = 30 FOR UPDATE`）
+
+```
+LOCK_TYPE | LOCK_MODE     | LOCK_DATA
+TABLE     | IX            | NULL
+RECORD    | X,REC_NOT_GAP | 30   ← Record Lock のみ（Gap なし）
+```
+
+### FOR UPDATE 範囲検索（`WHERE id > 20 AND id < 40 FOR UPDATE`）
+
+```
+LOCK_TYPE | LOCK_MODE     | LOCK_DATA
+TABLE     | IX            | NULL
+RECORD    | X,REC_NOT_GAP | 30   ← Record Lock のみ（Gap なし）
+```
+
+→ RU では範囲検索でも `X,REC_NOT_GAP` のみ。Gap Lock・Next-Key Lock は一切取得しない。
+
+### FOR SHARE（`WHERE id = 30 FOR SHARE`）
+
+```
+LOCK_TYPE | LOCK_MODE     | LOCK_DATA
+TABLE     | IS            | NULL
+RECORD    | S,REC_NOT_GAP | 30   ← 共有 Record Lock のみ
+```
+
+### RU セッションの INSERT が RR の Gap Lock でブロック
+
+```
+Session A (REPEATABLE READ): WHERE id > 20 AND id < 40 FOR UPDATE
+  → GRANTED: X (id=30), X,GAP (id=40)
+
+Session B (READ UNCOMMITTED): INSERT INTO products (id, ...) VALUES (25, ...);
+  → INSERT_INTENTION on gap (20,30) → Session A の X (id=30) の前ギャップで WAIT
+  → ERROR 1205: Lock wait timeout exceeded after 50s
+```
+
+**観察:** Gap Lock の効果は**ロックを保持する側の分離レベル**で決まる。INSERT 側が RU でも、RR セッションの Gap Lock によってブロックされる。
+
+---
+
+## 12. SERIALIZABLE 追加実測
+
+### FOR UPDATE PK 検索（`WHERE id = 30 FOR UPDATE`）
+
+```
+LOCK_TYPE | LOCK_MODE     | LOCK_DATA
+TABLE     | IX            | NULL
+RECORD    | X,REC_NOT_GAP | 30   ← Record Lock のみ（Gap なし）
+```
+
+→ PK ポイント検索は SERIALIZABLE でも `X,REC_NOT_GAP`（Gap Lock なし）。
+
+### FOR UPDATE 範囲検索（`WHERE id > 20 AND id < 40 FOR UPDATE`）
+
+```
+LOCK_TYPE | LOCK_MODE     | LOCK_DATA
+TABLE     | IX            | NULL
+RECORD    | X             | 30   ← Next-Key Lock: gap(20,30] + レコード
+RECORD    | X,GAP         | 40   ← Gap Lock: gap(30,40) のみ
+```
+
+→ REPEATABLE READ と同一のロックパターン。
+
+### 通常 SELECT 範囲（`WHERE id > 20 AND id < 40`、FOR SHARE なし）
+
+```
+LOCK_TYPE | LOCK_MODE | LOCK_DATA
+TABLE     | IS        | NULL
+RECORD    | S         | 30   ← 共有 Next-Key Lock（自動付与）
+RECORD    | S,GAP     | 40   ← 共有 Gap Lock（自動付与）
+```
+
+**観察:** SERIALIZABLE では `FOR SHARE` なしの通常 SELECT でも共有ロックが自動付与される。これが SERIALIZABLE がファントムリードを完全防止できる理由。
+
+---
+
 ## 分離レベルごとのロック挙動 完全サマリ（実測）
 
 ### ロック種類と LOCK_MODE 対応表
